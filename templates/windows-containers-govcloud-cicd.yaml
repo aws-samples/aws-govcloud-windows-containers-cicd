@@ -1,0 +1,901 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CI/CD pipeline to build a Windows container using AWS CodePipeline, AWS CodeBuild and System manager in AWS GovCloud (US) regions.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Build configuration
+        Parameters:
+          - S3ObjectKey
+          - EcrRepoName
+          - BuildAgentPool
+          - StopAfterBuild
+      - Label:
+          default: New build agent configuration
+        Parameters:
+          - BuildAgentAmiId
+          - BuildAgentInstanceType
+          - BuildAgentVolumeSize
+          - BuildAgentVolumeType
+          - BuildAgentName
+          - BuildAgentKeyPairName
+          - BuildAgentSubnetId
+          - BuildAgentSecurityGroupIds
+      - Label:
+          default: Logging
+        Parameters:
+          - CloudWatchLogGroupName
+    ParameterLabels:
+      BuildAgentInstanceType:
+        default: Build agent EC2 instance type
+      BuildAgentAmiId:
+        default: Build agent AMI ID
+      BuildAgentVolumeSize:
+        default: Build agent volume size
+      BuildAgentVolumeType:
+        default: Build agent volume type
+      BuildAgentName: 
+        default: Build agent name
+      BuildAgentKeyPairName:
+        default: Build agent key pair name [Optional]
+      CloudWatchLogGroupName:
+        default: CloudWatch log group name
+      EcrRepoName:
+        default: ECR repository name
+      S3ObjectKey:
+        default: Source code S3 object key
+      BuildAgentPool:
+        default: Build agent pool name
+      StopAfterBuild:
+        default: Stop build agent after job?
+      BuildAgentSubnetId:
+        default: Build agent Subnet ID
+      BuildAgentSecurityGroupIds:
+        default: Build agent Security Group ID(s)
+Parameters:
+  S3ObjectKey:
+    Type: String
+    Description: Key of the Amazon S3 object containing the source code to build.  
+    Default: windows-containers-govcloud-cicd.zip
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+  EcrRepoName:
+    Type: String
+    Description: Name of the target Amazon ECR repository.
+    Default: windows-containers-govcloud-cicd
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+  BuildAgentPool:
+    Type: String
+    Description: Name of the agent pool to use.
+    Default: windows-containers-govcloud-cicd
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+  StopAfterBuild:
+    Type: String
+    Description: Determines if build agents are stopped after a build job has finished.
+    Default: false
+    AllowedValues: [true, false]
+  BuildAgentAmiId:
+    Type: String
+    Description: AMI ID or SSM parameter expression used for new build agents.
+    Default: "{{ssm:/aws/service/ami-windows-latest/Windows_Server-2019-English-Core-ContainersLatest}}"
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+  BuildAgentInstanceType:
+    Type: String
+    Description: Type of EC2 instance used for new build agents. For more information, see https://aws.amazon.com/ec2/instance-types.
+    Default: t3.medium
+    AllowedValues: [t2.small, t2.medium, t2.large, 
+                    t3.small, t3.medium, t3.large,
+                    t3a.small, t3a.medium, t3a.large,
+                    c5.large, c5.xlarge,
+                    c5a.large, c5a.xlarge, 
+                    c5ad.large, c5ad.xlarge,
+                    r5.large, r5.xlarge, r5a.large, r5a.xlarge, r5b.large,
+                    i3.large, i3.xlarge,
+                    d3.large, d3.xlarge]
+  BuildAgentVolumeSize:
+    Type: Number
+    Description: Size in GBs for the EBS volume attached to new build agents.
+    Default: 50
+  BuildAgentVolumeType:
+    Type: String
+    Description: Type of EBS volume attached to new build agents. For more information, see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volume-types.html.
+    Default: gp3
+    AllowedValues: ["gp3", "gp2", "io2", "io1", "standard"]
+  BuildAgentName:
+    Type: String
+    Description: Value for the 'Name' tag assigned to new build agents.
+    Default: Windows Container Build Agent
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+  BuildAgentKeyPairName:
+    Type: String
+    Description: Name of the key pair used for new build agents.
+  BuildAgentSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID in which new build agents will run.
+    AllowedPattern : .+
+  BuildAgentSecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: List of Security Group IDs to attach to new build agents.
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+  CloudWatchLogGroupName:
+    Type: String
+    Description: Name of the Amazon CloudWatch log group where to collect logs from CodeBuild and the build agents.
+    Default: /aws-blog/windows-on-aws/windows-containers-govcloud-cicd
+    AllowedPattern : .+
+    ConstraintDescription: Required field
+Conditions: 
+  UseEc2KeyPair: !Not [!Equals [!Ref BuildAgentKeyPairName, ""]]
+Resources:
+  LoggingBucket:
+      Type: 'AWS::S3::Bucket'
+      Properties:
+        AccessControl: LogDeliveryWrite
+        BucketEncryption: 
+          ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true  
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+        - Sid: AllowSSLRequestsOnly
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource: 
+          - !Sub 'arn:aws:s3:::${LoggingBucket}'
+          - !Sub 'arn:aws:s3:::${LoggingBucket}/*'
+          Condition: 
+            Bool: 
+              "aws:SecureTransport": false
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: 
+        Status: Enabled
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: source-logs
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+        - Sid: AllowSSLRequestsOnly
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource: 
+          - !Sub 'arn:aws:s3:::${SourceBucket}'
+          - !Sub 'arn:aws:s3:::${SourceBucket}/*'
+          Condition: 
+            Bool: 
+              "aws:SecureTransport": false
+  ArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: artifacts-logs
+  ArtifactStoreBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactStoreBucket
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+        - Sid: AllowSSLRequestsOnly
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource: 
+          - !Sub 'arn:aws:s3:::${ArtifactStoreBucket}'
+          - !Sub 'arn:aws:s3:::${ArtifactStoreBucket}/*'
+          Condition: 
+            Bool: 
+              "aws:SecureTransport": false
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties: 
+      RepositoryName: !Ref EcrRepoName
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration: 
+        ScanOnPush: true
+      RepositoryPolicyText: 
+        Version: 2012-10-17
+        Statement: 
+          - Sid: AllowPullFromCodeBuild
+            Effect: Allow
+            Principal: 
+              Service: codebuild.amazonaws.com
+            Action: 
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+              - 'ecr:BatchCheckLayerAvailability'
+  CodePipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: !Sub AWS-CodePipeline-Service-${AWS::StackName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:       
+              - Action:
+                  - 'ec2:*'
+                  - 'cloudwatch:*'
+                  - 's3:*'
+                Resource: '*' # Needed for the pipeline to acces S3 buckets, EC2 instances and CloudWatch log groups.
+                Effect: Allow
+              - Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*' # Needed for the integration with AWS CodeBuild. https://docs.aws.amazon.com/codepipeline/latest/userguide/security-iam.html#how-to-custom-role 
+                Effect: Allow
+  CodePipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              RunOrder: 1
+              Namespace: source
+              Configuration:
+                S3Bucket: !Ref SourceBucket
+                S3ObjectKey: !Ref S3ObjectKey
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: SourceArtifact      
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              RunOrder: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: '[{"name": "IMAGE_TAG", "type": "PLAINTEXT", "value": "#{source.VersionId}"}]'   
+              OutputArtifacts:
+                - Name: BuildArtifact
+              InputArtifacts:
+                - Name: SourceArtifact
+  CodeBuildServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub aws-codebuild-service-${AWS::StackName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  Action:
+                  - 'ec2:TerminateInstances'
+                  - 'ec2:StopInstances'
+                  - 'ec2:StartInstances'
+                  - 'ssm:SendCommand'
+                  Condition: 
+                    StringEquals: 
+                      "aws:ResourceTag/aws-blog:cloudformation:stack-id": !Ref AWS::StackId
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  Action: 
+                  - 'ec2:StopInstances'
+                  - 'ec2:StartInstances'
+                  - 'ssm:SendCommand'
+                  Condition: 
+                    StringEquals: 
+                      "aws:ResourceTag/aws-blog:codebuild:agent-pool": !Ref BuildAgentPool                                             
+                - Effect: Allow
+                  Resource: 
+                    - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunPowerShellScript'
+                    - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${WindowsBuildDocument}'
+                  Action:
+                  - 'ssm:SendCommand'
+                  - 'ssm:CancelCommand'
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${WindowsBuildAgentRole}'
+                  Action:
+                  - 'iam:PassRole'
+                - Effect: Allow
+                  Resource: '*' # Needed for CodeBuildProject to check the status of running commands.
+                  Action:
+                  - 'ssm:DescribeAutomationExecutions'
+                  - 'ssm:DescribeInstanceInformation'
+                  - 'ssm:ListCommands'
+                  - 'ssm:ListCommandInvocations'
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/'
+                  Action:
+                  - 'ssm:StopAutomationExecution'
+                  - 'ssm:GetAutomationExecution'
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${WindowsBuildAgentRunbook}:$DEFAULT'
+                  Action:
+                  - 'ssm:StartAutomationExecution'
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-windows-latest/*'
+                  Action:
+                  - 'ssm:GetParameters'
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroupName}:*'
+                  Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                - Effect: Allow
+                  Resource: !Sub '${ArtifactStoreBucket.Arn}*'
+                  Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketAcl'
+                  - 's3:GetBucketLocation'                
+                - Effect: Allow
+                  Resource: '*' # Needed for WindowsBuildAgentRunbook to create new EC2 instances.
+                  Action:
+                  - 'ec2:RunInstances'
+                  - 'ec2:CreateTags' 
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeInstanceStatus'
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeDhcpOptions'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:CreateNetworkInterface'
+                - Effect: Allow
+                  Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                  Action:
+                  - 'ec2:CreateNetworkInterfacePermission'
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Source:
+        Type: CODEPIPELINE
+        InsecureSsl: false
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              DOCUMENT_NAME: ${WindowsBuildAgentRunbook}
+              ECR_REPO_URI: ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepo}
+              LOG_GROUP_NAME: ${CloudWatchLogGroupName}
+          phases:
+            pre_build:
+              commands:
+                - BUILD_ID=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-8)
+                - SRC_ARTIFACT_FULL_S3_PATH=${!CODEBUILD_SOURCE_VERSION#*"s3:::"}
+                - SRC_ARTIFACT_S3_PATH=${!SRC_ARTIFACT_FULL_S3_PATH#*"/"}
+                - SRC_ARTIFACT_BUCKET_NAME=$(echo $SRC_ARTIFACT_FULL_S3_PATH | cut -c 1-$((${!#SRC_ARTIFACT_FULL_S3_PATH} - ${!#SRC_ARTIFACT_S3_PATH} - 1)))
+                - echo SRC_ARTIFACT_FULL_S3_PATH=$SRC_ARTIFACT_FULL_S3_PATH
+                - echo SRC_ARTIFACT_S3_PATH=$SRC_ARTIFACT_S3_PATH
+                - echo SRC_ARTIFACT_BUCKET_NAME=$SRC_ARTIFACT_BUCKET_NAME
+            build:
+              commands:
+                - echo Starting automation execution using document $DOCUMENT_NAME...
+                - echo Logs are stored under CloudWatch Log Group $LOG_GROUP_NAME...
+                - EXECUTION_ID=$(aws ssm start-automation-execution --document-name $DOCUMENT_NAME --parameters ImageTag=$IMAGE_TAG,PipelineBucketName=$SRC_ARTIFACT_BUCKET_NAME,SourceArtifactS3Path=$SRC_ARTIFACT_S3_PATH --output text)
+                - echo Running execution $EXECUTION_ID...
+                - COMMAND="aws ssm describe-automation-executions --filters Key=ExecutionId,Values=$EXECUTION_ID"
+                - STATUS=$($COMMAND | jq -r ".AutomationExecutionMetadataList[0].AutomationExecutionStatus")
+                - | 
+                  while [ $STATUS = "InProgress" ]; 
+                    do sleep 3; 
+                    STATUS=$($COMMAND | jq -r ".AutomationExecutionMetadataList[0].AutomationExecutionStatus"); 
+                  done
+                - |
+                  if [ $STATUS = "Success" ]; 
+                  then echo Automation execution succeeded.; 
+                  else echo Automation execution failed. Please check CloudWatch log for details.; 
+                    ERROR_MSG=$($COMMAND | jq -r ".AutomationExecutionMetadataList[0].FailureMessage"); 
+                    echo SSM Failure Message Follows.; 
+                    echo $ERROR_MSG; 
+                    exit 1; 
+                  fi
+                - echo Writing image definition file...
+                - printf '[{"imageUri":"%s"}]' $ECR_REPO_URI:$IMAGE_TAG > imagedefinitions.json
+                - cat imagedefinitions.json
+          artifacts:
+            files:
+              - imagedefinitions.json
+      Artifacts:
+        Type: CODEPIPELINE
+        Packaging: NONE
+        EncryptionDisabled: false
+      Cache:
+        Type: NO_CACHE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image:  aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: IMAGE_TAG
+            Type: PLAINTEXT
+            Value: 1.0
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 480
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CloudWatchLogGroupName
+          Status: ENABLED
+        S3Logs:
+          Status: DISABLED
+  WindowsBuildDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: "2.2"
+        description: "Runs commands to build and push Windows container applications images"
+        parameters:    
+          WorkingDirectory:
+            description: Working directory for the command
+            type: String
+          EcrRepoName:
+            description: ECR Repo Name
+            type: String
+          ImageTag:
+            type: String
+            description: (Optional) Tag for container image.
+            default: latest
+        mainSteps:
+        - action: 'aws:runPowerShellScript'
+          name: buildCommands
+          inputs:
+            runCommand:
+            - |
+              cd {{WorkingDirectory}}
+              $tmpFolder = $(Get-Location).Path
+              $srcFolder = "$tmpFolder\src"
+            - |
+              Write-Host "*****Building Docker image...*****"
+                
+              $instanceInfo = (Invoke-RestMethod -Method Get -Uri http://169.254.169.254/latest/dynamic/instance-identity/document)
+              $repoUri = $instanceInfo.accountId  + '.dkr.ecr.' + $instanceInfo.region + '.amazonaws.com/{{EcrRepoName}}'
+              $latestUri = "$($repoUri):latest"
+              $hasCustomTag = $False
+              $buildArgs = @("-t", $latestUri)
+              $customTag = "{{ImageTag}}"
+
+              if ($customTag -and $($customTag -ne "latest")) {
+                $hasCustomTag = $True
+                $uriWithTag = "$($repoUri):$customTag"
+                $buildArgs += @("-t", $uriWithTag)
+              }                
+
+              Write-Host "Docker Build Args are '$buildArgs'"
+
+              cd $srcFolder
+              docker build $buildArgs $srcFolder\
+
+              if ($LASTEXITCODE -ne 0) {
+                throw ("'docker build $buildArgs $srcFolder\' execution failed with exit code $LASTEXITCODE.")
+              }
+            - |
+              Write-Host "*****Pushing Docker image to ECR...*****"
+                
+              Invoke-Expression –Command (Get-ECRLoginCommand –Region $region).Command
+              docker push $repoUri --all-tags
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "'docker push $repoUri --all-tags' execution failed with exit code $LASTEXITCODE."
+              }
+  WindowsBuildAgentRole: 
+    Type : AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactStoreBucket}/*'
+                Effect: Allow
+          PolicyName: s3-instance-bucket-policy        
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'ecr:GetAuthorizationToken'
+                Resource: '*' # Needed for the "Get-ECRLoginCommand" executed by WindowsBuildAgentRunbook to be succesfull.
+                Effect: Allow
+          PolicyName: ecr-instance-policy
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:GetRepositoryPolicy'
+                - 'ecr:DescribeRepositories'
+                - 'ecr:ListImages'
+                - 'ecr:DescribeImages'
+                - 'ecr:BatchGetImage'
+                - 'ecr:GetLifecyclePolicy'
+                - 'ecr:GetLifecyclePolicyPreview'
+                - 'ecr:ListTagsForResource'
+                - 'ecr:DescribeImageScanFindings'
+                - 'ecr:InitiateLayerUpload'
+                - 'ecr:UploadLayerPart'
+                - 'ecr:CompleteLayerUpload'
+                - 'ecr:PutImage'
+                Resource: !GetAtt EcrRepo.Arn
+                Effect: Allow
+          PolicyName: ecr-resource-instance-policy
+      Path: /
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'     
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+            - ssm.amazonaws.com
+          Action: 'sts:AssumeRole'
+  WindowsBuildAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref WindowsBuildAgentRole  
+  WindowsBuildAgentRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: "Orchestrates Windows Server build agents and start build jobs triggered by AWS CodeBuild."
+        parameters:
+          AmiId:
+            type: String
+            default: !Ref BuildAgentAmiId
+            description: The Windows Server AMI to use for the new build agents.
+          InstanceType:
+            type: String
+            description: (Optional) The EC2 instance type for new build agents.
+            default: !Ref BuildAgentInstanceType
+          IamInstanceProfileName:
+            type: String
+            description: (Required) The IAM instance profile to attach to new build agents.
+            default: !Ref WindowsBuildAgentInstanceProfile
+          InstanceVolumeSize:
+            type: Integer
+            description: (Required) Desired volume size (GiB) for new build agents.
+            default: !Ref BuildAgentVolumeSize
+          InstanceVolumeType:
+            type: String
+            description: (Required) Desired volume type for new build agents.
+            default: !Ref BuildAgentVolumeType
+          PipelineBucketName:
+            type: String
+            description: (Required) S3 Bucket to store build artifacts.
+            default: !Ref ArtifactStoreBucket
+          SourceArtifactS3Path: 
+            type: String
+            description: (Required) Build artifact key.
+          EcrRepoName: 
+            default: !Ref EcrRepo
+            description: (Required) ECR Repository name
+            type: String
+          ImageTag:
+            type: String
+            description: (Optional) Tag for the container image.
+            default: latest
+          BuildLogGroupName:
+            type: String
+            description: (Optional) CloudWatch Log Group Name used to store build agent's logs.
+            default: !Ref CloudWatchLogGroupName
+          AWSRegion:
+            type: String
+            description: (Required) Region in which the AWS resources live.
+            default: !Ref AWS::Region   
+          WorkingDirectory:
+            default: !Sub
+              - 'C:\\jobs\${BuildAgentJobId}'
+              - { BuildAgentJobId: !Select [2, !Split ['/', !Ref AWS::StackId]] }
+            description: Working directory for the command
+            type: String
+          StopAfterBuild:
+            type: String
+            description: (Required) Defines if the agent is going to be stopped after the build process.
+            default: !Ref StopAfterBuild
+        mainSteps:
+        - name: validateExistingInstance
+          action: 'aws:executeAwsApi'
+          maxAttempts: 2
+          onFailure: Continue
+          inputs:
+            Service: ec2
+            Api: DescribeInstances
+            Filters:
+              - Name: tag:aws-blog:codebuild:agent-pool
+                Values: 
+                  - !Ref BuildAgentPool
+              - Name: 'instance-state-name'
+                Values:
+                  - 'pending'
+                  - 'running'
+                  - 'stopped'
+          outputs:
+            - Name: InstanceId
+              Selector: '$.Reservations[0].Instances[0].InstanceId'
+              Type: String
+          isCritical: 'true'
+          nextStep: chooseIfStartOrCreateInstance
+        - name: chooseIfStartOrCreateInstance
+          action: aws:branch
+          inputs:
+            Choices:
+            - NextStep: describeInstances
+              Not:
+                Variable: "{{validateExistingInstance.InstanceId}}"
+                Contains: 'validateExistingInstance.InstanceId'
+            Default:
+              createNewInstance
+        - name: createNewInstance
+          action: 'aws:runInstances'
+          maxAttempts: 3
+          timeoutSeconds: 1200
+          onFailure: Abort
+          inputs:
+            ImageId: '{{ AmiId }}'
+            InstanceType: '{{ InstanceType }}'
+            MinInstanceCount: 1
+            MaxInstanceCount: 1
+            IamInstanceProfileName: '{{ IamInstanceProfileName }}'
+            KeyName: !If 
+              - UseEc2KeyPair
+              - !Ref BuildAgentKeyPairName
+              - !Ref "AWS::NoValue"
+            BlockDeviceMappings:
+              - DeviceName: /dev/sda1
+                Ebs:
+                  VolumeSize: '{{ InstanceVolumeSize }}'
+                  VolumeType: '{{ InstanceVolumeType }}'
+                  Encrypted: true
+            SubnetId: !Ref BuildAgentSubnetId
+            SecurityGroupIds: !Ref BuildAgentSecurityGroupIds
+            TagSpecifications:
+            - ResourceType: instance
+              Tags:
+              - Key: aws-blog:cloudformation:stack-id
+                Value: !Ref AWS::StackId
+              - Key: aws-blog:cloudformation:stack-name
+                Value: !Ref AWS::StackName
+              - Key: aws-blog:codebuild:agent-pool
+                Value: !Ref BuildAgentPool
+              - Key: Name
+                Value: !Ref BuildAgentName
+          nextStep: describeInstances   
+        - name: describeInstances
+          action: 'aws:executeAwsApi'
+          maxAttempts: 2
+          onFailure: Continue
+          inputs:
+            Service: ec2
+            Api: DescribeInstances
+            Filters:
+              - Name: tag:aws-blog:codebuild:agent-pool
+                Values: 
+                  - !Ref BuildAgentPool
+              - Name: 'instance-state-name'
+                Values:
+                  - 'pending'
+                  - 'running'
+                  - 'stopped'
+          outputs:
+            - Name: Reservations
+              Selector: '$.Reservations'
+              Type: MapList
+          isCritical: 'true'
+          nextStep: selectInstance
+        - name: selectInstance
+          action: aws:executeScript
+          inputs: 
+            Runtime: PowerShell Core 6.0
+            InputPayload: 
+              describeInstances: "{{describeInstances.Reservations}}"
+            Script: |
+              $payload = $env:InputPayload | ConvertFrom-Json  
+              $instances = $payload.describeInstances | Select-Object -ExpandProperty Instances
+              $selectedInstanceId = 0
+
+              if($instances -and $instances.Length -gt 0) {
+                # Gets random instance id to run the build command into
+                $selectedInstanceId = Get-Random -Minimum 0 -Maximum $instances.Length
+              }
+
+              return $instances[$selectedInstanceId].InstanceId
+          outputs:
+            - Name: InstanceId
+              Selector: '$.Payload'
+              Type: String
+          isCritical: 'true'
+          nextStep: startInstance
+        - name: startInstance
+          action: 'aws:changeInstanceState'
+          maxAttempts: 3
+          timeoutSeconds: 1200
+          onFailure: Continue
+          inputs:
+            InstanceIds:
+              - '{{selectInstance.InstanceId}}'
+            DesiredState: running
+          isCritical: 'true'
+          nextStep: waitForInstanceToBeReady         
+        - name: waitForInstanceToBeReady
+          action: 'aws:waitForAwsResourceProperty'
+          onFailure: 'step:stopInstance'
+          timeoutSeconds: 600
+          maxAttempts: 2
+          inputs:
+            Service: ec2
+            Api: DescribeInstanceStatus
+            InstanceIds:
+              - '{{ selectInstance.InstanceId }}'
+            PropertySelector: '$.InstanceStatuses[0].InstanceStatus.Details[0].Status'
+            DesiredValues:
+              - passed
+          isCritical: 'true'
+          nextStep: waitForSSMAgentOnline
+        - name: waitForSSMAgentOnline
+          action: 'aws:waitForAwsResourceProperty'
+          onFailure: 'step:stopInstance'
+          timeoutSeconds: 600
+          inputs:
+            Service: ssm
+            Api: DescribeInstanceInformation
+            InstanceInformationFilterList:
+              - key: InstanceIds
+                valueSet:
+                  - '{{ selectInstance.InstanceId }}'
+            PropertySelector: '$.InstanceInformationList[0].PingStatus'
+            DesiredValues:
+              - Online
+          isCritical: 'true'
+          nextStep: downloadSource        
+        - name: downloadSource
+          action: 'aws:runCommand'
+          onFailure: 'step:chooseIfStopInstance'
+          timeoutSeconds: 1200
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+              - '{{ selectInstance.InstanceId }}'
+            Parameters:
+              commands: |
+                $ErrorActionPreference = "Stop"
+                                
+                Write-Host "*****Downloading from S3...*****"
+                $workingFolder =  "{{WorkingDirectory}}"
+                $tmpFolder = "$workingFolder\temp"
+                $srcFolder = "$workingFolder\src"
+                $key = "{{SourceArtifactS3Path}}"
+                $tempFileName = "$(Split-Path $key -Leaf)"
+
+                If(-Not (Test-Path -Path $workingFolder)) {
+                    New-Item $workingFolder -ItemType Directory
+                }
+                Get-ChildItem -Path $workingFolder -Include * | Remove-Item -Recurse
+                
+                New-Item $workingFolder -ItemType directory -Force | out-null
+                New-Item $tmpFolder -ItemType directory -Force | out-null
+                New-Item $srcFolder -ItemType directory -Force | out-null                              
+
+                Set-DefaultAWSRegion -Region "{{AWSRegion}}" # This is used for GovCloud accounts
+                Read-S3Object -BucketName "{{PipelineBucketName}}" -Key $key -File "$tmpFolder\$tempFileName"
+                Expand-Archive -Path "$tmpFolder\$tempFileName" -DestinationPath "$srcFolder" -Force
+
+                Write-Host "Source downloaded succesfully to '$srcFolder.'"
+                dir $srcFolder
+              executionTimeout: '1200'
+            CloudWatchOutputConfig:
+              CloudWatchLogGroupName: '{{ BuildLogGroupName }}'
+              CloudWatchOutputEnabled: true
+          isCritical: 'true'
+          nextStep: runBuildCommand
+        - name: runBuildCommand
+          action: 'aws:runCommand'
+          onFailure: 'step:chooseIfStopInstance'
+          timeoutSeconds: 7200
+          inputs:
+            DocumentName: !Ref WindowsBuildDocument
+            InstanceIds:
+              - '{{ selectInstance.InstanceId }}'
+            Parameters:
+              WorkingDirectory: '{{ WorkingDirectory }}'
+              EcrRepoName: '{{ EcrRepoName }}'
+              ImageTag: '{{ ImageTag }}'
+            CloudWatchOutputConfig:
+              CloudWatchLogGroupName: '{{ BuildLogGroupName }}'
+              CloudWatchOutputEnabled: true
+          isCritical: 'true'
+          nextStep: chooseIfStopInstance
+        - name: chooseIfStopInstance
+          action: aws:branch
+          inputs:
+            Choices:
+            - NextStep: stopInstance
+              Variable: "{{ StopAfterBuild }}"
+              Contains: 'true'
+          isCritical: 'true'
+          isEnd: 'true'
+        - name: stopInstance
+          action: 'aws:changeInstanceState'
+          maxAttempts: 3
+          timeoutSeconds: 1200
+          onFailure: Continue
+          inputs:
+            InstanceIds:
+              - '{{selectInstance.InstanceId}}'
+            DesiredState: stopped
+          isCritical: 'false'
+          isEnd: 'true'
