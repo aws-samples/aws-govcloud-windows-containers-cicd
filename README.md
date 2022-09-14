@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This project contains code used and explored in the AWS blog post [Building Windows containers with AWS CodePipeline on AWS GovCloud (US)]().
+This project contains code used and explored in the AWS blog post [Building Windows containers with AWS CodePipeline on AWS GovCloud (US)](https://aws.amazon.com/blogs/modernizing-with-aws/building-windows-containers-with-aws-codepipeline-on-aws-govcloud-us/).
 
 ## Folder structure
 
